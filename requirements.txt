@@ -1,0 +1,6 @@
+python-telegram-bot>=20.8
+gradio_client>=2.6.0
+pillow>=10.2.0
+python-dotenv>=1.0.1
+requests>=2.31.0
+httpx>=0.27.0
