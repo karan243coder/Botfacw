@@ -107,21 +107,23 @@ def start_koyeb_health_server():
 
 # ----------------- Space Keep-Alive Background Worker -----------------
 def space_keepalive_worker():
-    """Periodically pings HuggingFace spaces so they never go to sleep / return 503."""
+    """Periodically warms HuggingFace spaces using browser User-Agent headers."""
     spaces_to_warm = [
         "https://yanze-pulid-flux.hf.space/config",
-        "https://instantx-instantid.hf.space/config"
+        "https://instantx-instantid.hf.space/config",
+        "https://tencentarc-photomaker-v2.hf.space/config"
     ]
-    time.sleep(5)  # Wait for startup
+    time.sleep(5)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
     while True:
         for url in spaces_to_warm:
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     pass
             except Exception:
                 pass
-        time.sleep(300)  # Ping every 5 minutes
+        time.sleep(300)
 
 def start_keepalive_thread():
     t = threading.Thread(target=space_keepalive_worker, daemon=True)
@@ -188,31 +190,39 @@ def apply_aspect_ratio(image_path: str, ratio_str: str) -> str:
         logger.warning(f"Error applying aspect ratio crop: {e}")
         return image_path
 
-def get_hf_client_with_retry(space_name: str, max_retries: int = 5):
-    """Connects to HuggingFace space with 5-step retry mechanism to allow containers to boot."""
+def get_hf_client_with_retry(space_name: str, max_retries: int = 4):
+    """
+    Connects to HuggingFace space with browser headers & timeout protection
+    to prevent Cloudflare/Koyeb 503 IP blocks.
+    """
     if space_name in CLIENT_CACHE:
         return CLIENT_CACHE[space_name]
 
     token = HF_TOKEN.strip() if (HF_TOKEN and len(HF_TOKEN.strip()) > 5) else None
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     for attempt in range(1, max_retries + 1):
         try:
             logger.info(f"Connecting to space '{space_name}' (Attempt {attempt}/{max_retries})...")
-            if token:
-                try:
-                    c = Client(space_name, token=token)
-                except TypeError:
-                    c = Client(space_name, headers={"Authorization": f"Bearer {token}"})
-            else:
-                c = Client(space_name)
-            
+            c = Client(
+                space_name,
+                token=token,
+                headers=headers,
+                httpx_kwargs={"timeout": 60.0}
+            )
             CLIENT_CACHE[space_name] = c
             logger.info(f"Connected and cached space: {space_name}")
             return c
         except Exception as e:
             logger.warning(f"Connection attempt {attempt} for {space_name} encountered: {e}")
             if attempt < max_retries:
-                time.sleep(5)  # Allow 5s for the container to finish booting
+                time.sleep(4)
             else:
                 raise
 
@@ -318,7 +328,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
     # 1. Primary Engine: FLUX.1 + PuLID (Maximum Fidelity 1.40x)
     try:
         logger.info("Calling PuLID-FLUX engine with maximum identity weight (1.40)...")
-        flux_client = get_hf_client_with_retry("yanze/PuLID-FLUX", max_retries=5)
+        flux_client = get_hf_client_with_retry("yanze/PuLID-FLUX", max_retries=4)
         res = flux_client.predict(
             prompt=enhanced_prompt,
             id_image=handle_file(face_image_path),
@@ -344,32 +354,62 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
         logger.warning(f"PuLID-FLUX encountered: {e}. Falling back to InstantID Photorealism...")
 
     # 2. Secondary Engine: InstantID Photorealism (IdentityNet 1.25x)
-    instant_client = get_hf_client_with_retry("InstantX/InstantID", max_retries=5)
-    res = instant_client.predict(
-        face_image_path=handle_file(face_image_path),
-        pose_image_path=handle_file(face_image_path),
-        prompt=enhanced_prompt,
-        negative_prompt=negative_prompt,
-        style_name="(No style)",
-        num_steps=35,
-        identitynet_strength_ratio=1.25,
-        adapter_strength_ratio=1.05,
-        canny_strength=0.0,
-        depth_strength=0.0,
-        controlnet_selection=[],
-        guidance_scale=4.5,
-        seed=int(time.time()) % 1000000,
-        scheduler="EulerDiscreteScheduler",
-        enable_LCM=False,
-        enhance_face_region=True,
-        api_name="/generate_image"
-    )
+    try:
+        instant_client = get_hf_client_with_retry("InstantX/InstantID", max_retries=4)
+        res = instant_client.predict(
+            face_image_path=handle_file(face_image_path),
+            pose_image_path=handle_file(face_image_path),
+            prompt=enhanced_prompt,
+            negative_prompt=negative_prompt,
+            style_name="(No style)",
+            num_steps=35,
+            identitynet_strength_ratio=1.25,
+            adapter_strength_ratio=1.05,
+            canny_strength=0.0,
+            depth_strength=0.0,
+            controlnet_selection=[],
+            guidance_scale=4.5,
+            seed=int(time.time()) % 1000000,
+            scheduler="EulerDiscreteScheduler",
+            enable_LCM=False,
+            enhance_face_region=True,
+            api_name="/generate_image"
+        )
 
+        if isinstance(res, (list, tuple)) and len(res) > 0:
+            raw_path = res[0]
+            if isinstance(raw_path, dict) and "path" in raw_path:
+                raw_path = raw_path["path"]
+            return apply_aspect_ratio(str(raw_path), ratio_str)
+    except Exception as e:
+        logger.warning(f"InstantID encountered: {e}. Falling back to PuLID SDXL...")
+
+    # 3. Tertiary Engine: PuLID SDXL
+    pulid_sdxl = get_hf_client_with_retry("yanze/PuLID", max_retries=3)
+    res = pulid_sdxl.predict(
+        param_0=handle_file(face_image_path),
+        param_1=handle_file(face_image_path),
+        param_2=handle_file(face_image_path),
+        param_3=handle_file(face_image_path),
+        param_4=enhanced_prompt,
+        param_5=negative_prompt,
+        param_6=1.3,
+        param_7=1,
+        param_8=int(time.time()) % 1000000,
+        param_9=4,
+        param_10=h,
+        param_11=w,
+        param_12=1.0,
+        param_13="fidelity",
+        param_14=False,
+        api_name="/run"
+    )
     if isinstance(res, (list, tuple)) and len(res) > 0:
-        raw_path = res[0]
-        if isinstance(raw_path, dict) and "path" in raw_path:
-            raw_path = raw_path["path"]
-        return apply_aspect_ratio(str(raw_path), ratio_str)
+        raw_list = res[0]
+        if isinstance(raw_list, list) and len(raw_list) > 0:
+            first_item = raw_list[0]
+            img_path = first_item.get("image", {}).get("path") if isinstance(first_item, dict) else str(first_item)
+            return apply_aspect_ratio(str(img_path), ratio_str)
 
     raise ValueError("Image generation failed on all available engines.")
 
@@ -458,9 +498,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_msg = (
         "📊 **Bot Status:**\n"
-        "• **AI Engine:** FLUX.1-Dev + Smart Hinglish Parser\n"
+        "• **AI Engine:** Multi-Model Failover (FLUX.1 + InstantID + PuLID)\n"
         "• **Face Lock:** 🟢 100% High-Fidelity (1.40x Weight)\n"
-        "• **Framing:** 🟢 Full Body / Kamar tak / Close Up\n"
+        "• **Anti-503 Protection:** 🟢 Browser Headers & Keep-Alive Active\n"
         "• **Content Policy:** 🔓 100% Unrestricted / Uncensored\n"
         f"• **Target Ratio:** `{current_ratio}`\n"
         f"• **Face Status:** {has_face}\n"
@@ -610,8 +650,8 @@ def main():
 
     print("========================================")
     print("🤖 Starting Uncensored Real DSLR Face Bot")
-    print("📦 Engine: FLUX.1-Dev + Smart Hinglish Engine")
-    print("💎 Fidelity: 100% Face Match + Zero Restrictions")
+    print("📦 Engine: FLUX.1-Dev + Multi-Model Failover")
+    print("💎 Anti-503 Headers & Keep-Alive Active")
     print(f"💾 Temp Directory: {TEMP_DIR}")
     print("========================================")
 
