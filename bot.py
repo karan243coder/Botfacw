@@ -30,7 +30,7 @@ logging.basicConfig(
     format="%(asctime)s - [%(levelname)s] - %(name)s: %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger("UncensoredRealFaceBot")
+logger = logging.getLogger("UltraRealFaceBot")
 
 # Environment configurations
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -52,7 +52,6 @@ TEMP_DIR.mkdir(exist_ok=True)
 CLIENT_CACHE = {}
 
 # In-memory user state
-# Schema: { user_id: { "face_path": str, "crop_path": str, "ratio": str, "framing": str, "last_active": float } }
 user_sessions = {}
 
 # Available aspect ratios
@@ -193,48 +192,87 @@ def get_hf_client_with_retry(space_name: str, max_retries: int = 3):
             else:
                 raise
 
-def detect_framing_and_enhance_prompt(user_prompt: str) -> str:
+# ----------------- Hinglish AI Prompt Engine -----------------
+def translate_hinglish_to_dslr_prompt(user_prompt: str) -> str:
     """
-    Intelligently detects desired camera framing (Full Body, Waist-Up, Close-Up)
-    and injects exact camera focal lengths + real skin and body textures without censorship.
+    Translates raw Hinglish/Hindi user prompts into high-fidelity,
+    photorealistic English diffusion prompts with camera optics & real skin physics.
+    Zero censorship / Completely unrestricted.
     """
-    lower_p = user_prompt.lower()
-    
-    # 1. Full Body Detection
-    is_full_body = any(k in lower_p for k in [
-        "full body", "full photo", "full length", "poori photo", "head to toe", "standing full", "legs", "feet", "shoes", "heels"
-    ])
-    
-    # 2. Waist-Up / Half Body Detection
-    is_waist_up = any(k in lower_p for k in [
-        "kamar tak", "waist up", "half body", "medium shot", "upper body", "kamar", "half photo"
-    ])
-    
-    # 3. Close Up Detection
-    is_close_up = any(k in lower_p for k in [
-        "close up", "face only", "portrait", "chehra"
-    ])
+    raw = user_prompt.strip()
+    p = raw.lower()
 
-    if is_full_body:
-        framing_tag = "full body shot, standing full length from head to toe, wide shot, shot on 35mm wide lens"
-    elif is_waist_up:
-        framing_tag = "medium shot, waist up shot, upper body framing, shot on 50mm lens"
-    elif is_close_up:
-        framing_tag = "close-up portrait photo, intimate face framing, shot on 85mm lens"
-    else:
-        # Default: natural framing based on user's direct prompt
-        framing_tag = "shot on professional camera with natural lens framing"
+    # 1. Framing Detection
+    framing = "medium shot, waist up shot, shot on 50mm lens"
+    if any(k in p for k in ["full", "poori", "pura", "sir se pair", "khadi", "head to toe", "legs", "feet", "heels", "standing", "pair tak"]):
+        framing = "full body shot, standing full length from head to toe, wide shot, shot on 35mm lens"
+    elif any(k in p for k in ["kamar", "waist", "half", "aadha", "upper body", "chest", "chhati"]):
+        framing = "medium shot, waist up framing, upper body, shot on 50mm lens"
+    elif any(k in p for k in ["close up", "face", "chehra", "portrait", "sirf face", "eyes"]):
+        framing = "close-up portrait shot, sharp focus on facial features and eyes, shot on 85mm f1.4 lens"
 
-    return (
-        f"raw color 8k photograph, real life DSLR photography of the exact person in reference, "
-        f"{framing_tag}, {user_prompt}, "
-        f"hyperrealistic natural skin texture with visible micro-pores, natural skin subsurface scattering, "
-        f"accurate real body anatomy, natural shadows, authentic cloth and leather fabric texture, "
-        f"soft natural lighting, masterpiece ultra-sharp photography"
+    # 2. Hinglish Vocabulary Replacements
+    replacements = [
+        # Framing & Poses
+        (r'\bkamar tak\b', 'waist up'),
+        (r'\bpoori photo\b', 'full body photo'),
+        (r'\bpura photo\b', 'full body photo'),
+        (r'\bsir se pair\b', 'head to toe'),
+        (r'\bkhadi hui\b', 'standing gracefully'),
+        (r'\bkhadi\b', 'standing'),
+        (r'\bbaithi hui\b', 'sitting gracefully'),
+        (r'\bbaithi\b', 'sitting'),
+        (r'\bleti hui\b', 'reclining lying down sensually'),
+        (r'\bsoi hui\b', 'lying in bed'),
+        (r'\bsamne dekhte huye\b', 'looking directly at camera'),
+        (r'\bsamne dekho\b', 'looking directly at camera'),
+        (r'\bsamne dekh\b', 'looking directly at camera'),
+        (r'\bsamne\b', 'looking at camera'),
+        (r'\bhath kamar par\b', 'hands on hips seductive pose'),
+        (r'\bmud kar\b', 'looking over shoulder'),
+
+        # Outfits & Modifiers
+        (r'\bpehan kar\b', 'wearing'),
+        (r'\bpehna do\b', 'wearing'),
+        (r'\bpehna\b', 'wearing'),
+        (r'\bkapde\b', 'outfit'),
+        (r'\bme\b', 'in'),
+        (r'\bhawa me baal\b', 'wind-blown flowing natural hair'),
+        (r'\bhawa me\b', 'wind blowing'),
+        (r'\bbaal khule\b', 'open wavy long black hair'),
+        (r'\bsundar\b', 'stunningly gorgeous'),
+        (r'\bchhat par\b', 'on modern rooftop terrace'),
+        (r'\bkamre me\b', 'in luxury bedroom'),
+        (r'\bkamra\b', 'luxury bedroom'),
+        (r'\bbed par\b', 'on luxury silk bed'),
+        (r'\bsofe par\b', 'on luxury velvet couch'),
+        (r'\bpani me\b', 'in crystal clear water'),
+        (r'\bsamundar par\b', 'on tropical beach'),
+        (r'\bchahiye\b', ''),
+        (r'\bkar do\b', ''),
+        (r'\bbana do\b', ''),
+        (r'\bbanao\b', ''),
+        (r'\bphoto\b', 'photograph'),
+    ]
+
+    translated_subject = p
+    for pattern, repl in replacements:
+        translated_subject = re.sub(pattern, repl, translated_subject)
+    
+    translated_subject = re.sub(r'\s+', ' ', translated_subject).strip()
+
+    # Final prompt combines user intent with real human physics
+    final_prompt = (
+        f"raw color 8k photograph, exact 100% real life DSLR photography of the woman in reference, "
+        f"{framing}, {translated_subject}, "
+        f"hyperrealistic natural skin texture with visible fine skin pores, authentic skin subsurface scattering, "
+        f"100% anatomical body accuracy, natural skin tones and soft shadows, realistic fabric and skin physics, "
+        f"shot on Sony Alpha 1, soft studio natural lighting, ultra-sharp optical clarity, masterpiece photography"
     )
+    return final_prompt
 
 def build_uncensored_negative_prompt() -> str:
-    """Permissive quality negative prompt (Zero Content Restrictions)."""
+    """Permissive negative prompt focused exclusively on preventing CGI / cartoon artifacts."""
     return (
         "cartoon, anime, 3d render, cgi, illustration, drawing, painting, smooth plastic skin, "
         "wax doll, airbrushed, fake, porcelain skin, deformed face, bad eyes, disfigured anatomy, "
@@ -244,31 +282,31 @@ def build_uncensored_negative_prompt() -> str:
 def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: str = "9:16") -> str:
     """
     Generates uncensored photo preserving 100% facial identity, natural skin pores,
-    real body texture, and exact camera framing.
+    real body texture, and exact Hinglish prompt intent.
     """
     logger.info(f"Generating realistic image for: {face_image_path} | prompt: '{prompt}' | ratio: '{ratio_str}'")
     
     w, h = FLUX_DIMENSIONS.get(ratio_str, (896, 1152))
-    enhanced_prompt = detect_framing_and_enhance_prompt(prompt)
+    enhanced_prompt = translate_hinglish_to_dslr_prompt(prompt)
     negative_prompt = build_uncensored_negative_prompt()
 
-    logger.info(f"Enhanced Prompt: {enhanced_prompt}")
+    logger.info(f"Hinglish Translated Prompt: {enhanced_prompt}")
 
-    # 1. Primary Engine: FLUX.1 + PuLID (Maximum Fidelity)
+    # 1. Primary Engine: FLUX.1 + PuLID (Maximum Fidelity 1.40x)
     try:
-        logger.info("Calling PuLID-FLUX engine with maximum identity lock (1.35)...")
+        logger.info("Calling PuLID-FLUX engine with maximum identity weight (1.40)...")
         flux_client = get_hf_client_with_retry("yanze/PuLID-FLUX", max_retries=3)
         res = flux_client.predict(
             prompt=enhanced_prompt,
             id_image=handle_file(face_image_path),
             start_step=0,
-            guidance=4.0,
+            guidance=4.2,
             seed=str(int(time.time()) % 1000000),
             true_cfg=1.0,
             width=w,
             height=h,
-            num_steps=26,
-            id_weight=1.35,  # Increased identity lock for 100% face match
+            num_steps=28,
+            id_weight=1.40,  # Maximum face identity lock
             neg_prompt=negative_prompt,
             timestep_to_start_cfg=1.0,
             max_sequence_length=512,
@@ -282,7 +320,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
     except Exception as e:
         logger.warning(f"PuLID-FLUX encountered: {e}. Falling back to InstantID Photorealism...")
 
-    # 2. Secondary Engine: InstantID Photorealism
+    # 2. Secondary Engine: InstantID Photorealism (IdentityNet 1.25x)
     instant_client = get_hf_client_with_retry("InstantX/InstantID", max_retries=3)
     res = instant_client.predict(
         face_image_path=handle_file(face_image_path),
@@ -291,8 +329,8 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
         negative_prompt=negative_prompt,
         style_name="(No style)",
         num_steps=35,
-        identitynet_strength_ratio=1.15,  # Strong identity lock
-        adapter_strength_ratio=1.0,       # Deep semantic face match
+        identitynet_strength_ratio=1.25,  # Strong 1:1 facial identity lock
+        adapter_strength_ratio=1.05,      # Deep facial semantic preservation
         canny_strength=0.0,
         depth_strength=0.0,
         controlnet_selection=[],
@@ -315,7 +353,6 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
 # ----------------- Telegram Handlers -----------------
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
     user = update.effective_user
     user_id = user.id
     
@@ -324,35 +361,33 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"👋 **Namaste {user.first_name}!**\n\n"
-        "Main ek **Uncensored Ultra-Realistic AI Studio Bot** hu jo Seedream 5.0 & Nano Banana Pro jaisi "
+        "Main ek **Ultra-Realistic DSLR AI Studio Bot** hu jo Seedream 5.0 & Nano Banana Pro jaisi "
         "**100% Face Match, Real Skin Pores, Full Body / Kamar tak Framing, aur Real Body Texture** ke sath images generate karta hai!\n\n"
-        "⚡ **Aap kya-kya control kar sakte hain?**\n"
-        "• **Framing Control:**\n"
-        "   - `Full Body photo / Head to toe` ➡️ Poori lambi photo (sir se pair tak)\n"
-        "   - `Kamar tak / Waist up` ➡️ Kamar tak ki photo\n"
-        "   - `Close up / Portrait` ➡️ Sirf chehre ki photo\n"
-        "• **100% Face Lock:** Aankhein, naak, bindi, lips exact wahi rahenge.\n"
-        "• **Zero Censorship / Dress Freedom:** Bunny cosplay, bikini, gowns, suits bina kisi restriction ke!\n"
-        "• **HD Ratios:** 9:16 (Reels/Shorts), 16:9 (Landscape), 1:1, 3:4, 4:3.\n\n"
+        "⚡ **Smart Hinglish Support:**\n"
+        "Aap seedhe Hinglish me likh sakte hain — bot automatically samajh kar execute karega!\n\n"
+        "• *Full Body:* `full body photo khadi hui bikini me`\n"
+        "• *Kamar Tak:* `kamar tak photo red dress me seductive pose`\n"
+        "• *Cosplay / Creative:* `bunny cosplay pehna do luxury bedroom me`\n"
+        "• *100% Face Lock:* Aankhein, naak, bindi, lips exact wahi rahenge.\n"
+        "• *Zero Restrictions:* Koi prompt block nahi hoga!\n\n"
         "🚀 **Kaise use karein?**\n"
         "1️⃣ Pehle apni ek **clear Face Photo** bhejo.\n"
-        "2️⃣ Uske baad jo bhi **Dress, Pose, ya Framing (Full Body / Kamar tak)** chahiye prompt bhej do!"
+        "2️⃣ Uske baad jo bhi prompt Hinglish ya English me likhna hai bhej do!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
     help_text = (
-        "💡 **Framing & Prompting Guide:**\n\n"
+        "💡 **Hinglish Prompting Examples:**\n\n"
         "📏 **1. Full Body Shot (Sir se Pair tak):**\n"
-        "• `full body shot, standing full length head to toe, wearing sexy black bunny cosplay dress, high heels, alluring pose, 8k`\n"
-        "• `full body standing in luxury red evening gown on staircase, photorealistic`\n\n"
+        "• `full body photo khadi hui sexy black bunny cosplay dress me, high heels, seductive pose`\n"
+        "• `poori photo red silk gown me luxury hotel lobby me khadi`\n\n"
         "📐 **2. Kamar Tak (Waist-Up Shot):**\n"
-        "• `waist up shot, kamar tak photo, wearing sexy black leather top, confident pose looking at camera`\n"
-        "• `half body photo, wearing royal silk saree with jewelry`\n\n"
+        "• `kamar tak photo sexy leather top me, samne dekhte huye attractive pose`\n"
+        "• `half body photo royal saree aur jewelry me`\n\n"
         "🔍 **3. Close Up (Face Shot):**\n"
-        "• `close up portrait, detailed eyes, soft studio lighting`\n\n"
-        "✨ **Note:** Aap prompt me seedhe likhenge: `full body` ya `kamar tak` toh bot exact wahi camera distance set karega!"
+        "• `close up face photo, detailed eyes, soft studio lighting`\n\n"
+        "✨ **Note:** Aap Hindi/Hinglish me jaise bolenge, bot exact waisa hi frame aur dress banayega!"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -377,7 +412,7 @@ async def ratio_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         else:
             user_sessions[user_id]["ratio"] = selected_ratio
             
-        await query.edit_message_text(f"✅ **Aspect Ratio set to:** `{selected_ratio}`\nAb apna prompt bhejiye (Full Body / Kamar tak / Dress)!", parse_mode="Markdown")
+        await query.edit_message_text(f"✅ **Aspect Ratio set to:** `{selected_ratio}`\nAb apna Hinglish ya English prompt bhejiye!", parse_mode="Markdown")
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -400,14 +435,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_msg = (
         "📊 **Bot Status:**\n"
-        "• **AI Engine:** FLUX.1-Dev (Uncensored Real Engine)\n"
-        "• **Face Lock:** 🟢 100% High-Fidelity (1.35x Weight)\n"
-        "• **Framing Control:** 🟢 Full Body / Waist-Up / Close-Up\n"
-        "• **Restrictions:** 🔓 Zero Content Restrictions\n"
+        "• **AI Engine:** FLUX.1-Dev + Smart Hinglish Parser\n"
+        "• **Face Lock:** 🟢 100% High-Fidelity (1.40x Weight)\n"
+        "• **Framing:** 🟢 Full Body / Kamar tak / Close Up\n"
+        "• **Content Policy:** 🔓 100% Unrestricted / Uncensored\n"
         f"• **Target Ratio:** `{current_ratio}`\n"
         f"• **Face Status:** {has_face}\n"
         "• **Server Mode:** Koyeb (512MB RAM Optimized)\n"
-        "• **System Health:** 🟢 Online & Healthy"
+        "• **System Health:** 🟢 Online & Ready"
     )
     await update.message.reply_text(status_msg, parse_mode="Markdown")
 
@@ -434,14 +469,14 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     caption = update.message.caption
     if caption and len(caption.strip()) > 2:
-        await update.message.reply_text("✅ **Reference Face Saved!**\nDirect prompt detect hua hai, generation start kar raha hu...")
+        await update.message.reply_text("✅ **Reference Face Saved!**\nDirect prompt detect hua hai, Real DSLR generation start kar raha hu...")
         await generate_image_flow(update, context, caption.strip())
     else:
         await update.message.reply_text(
             "✅ **Face & Micro-Features Successfully Saved!**\n\n"
-            "Ab bataiye kaisa photo chahiye? (Framing + Dress + Pose):\n"
-            "• *Example (Full Body):* `full body shot standing head to toe, sexy bunny cosplay outfit, 8k`\n"
-            "• *Example (Kamar tak):* `waist up shot kamar tak, red evening dress, seductive pose`\n\n"
+            "Ab bataiye kaisa photo chahiye? (Seedhe Hinglish me likhein):\n"
+            "• *Example:* `full body photo sexy bunny cosplay me khadi hui`\n"
+            "• *Example:* `kamar tak photo red saree me seductive pose`\n\n"
             "📐 Ratio badalne ke liye `/ratio` dabayein.",
             parse_mode="Markdown"
         )
@@ -463,7 +498,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
             user_sessions[user_id]["crop_path"] = crop_path
             user_sessions[user_id]["last_active"] = time.time()
             
-        await update.message.reply_text("✅ **High-Res Image Saved!**\nAb apna prompt bhejiye (Full Body / Kamar tak).", parse_mode="Markdown")
+        await update.message.reply_text("✅ **High-Res Image Saved!**\nAb apna Hinglish ya English prompt bhejiye.", parse_mode="Markdown")
     else:
         await update.message.reply_text("⚠️ Kripya JPG ya PNG format ki image file bhejein.")
 
@@ -488,11 +523,11 @@ async def generate_image_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     status_msg = await update.message.reply_text(
-        f"⏳ **Generating Accurate Real Photo...**\n"
+        f"⏳ **Generating 100% Real Photo...**\n"
         f"• **Prompt:** _{prompt}_\n"
         f"• **Ratio:** `{ratio_str}`\n"
-        "• **Quality:** 📸 100% Face Lock + Accurate Framing\n\n"
-        "⚡ *Generating via Free GPU (20-30 seconds lag sakte hain, please wait...)*",
+        "• **Quality:** 📸 100% Face Match + Real Body Physics\n\n"
+        "⚡ *Free GPU pipeline active (20-30 seconds lag sakte hain, please wait...)*",
         parse_mode="Markdown"
     )
 
@@ -515,8 +550,8 @@ async def generate_image_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"✨ **Generation Successful!** ({elapsed}s)\n\n"
                 f"📝 **Prompt:** {prompt}\n"
                 f"📐 **Ratio:** {ratio_str}\n"
-                "📸 **Fidelity:** 100% Face Match & Real Anatomy\n\n"
-                "💡 *Nayi photo ke liye prompt bhejein (Full Body / Kamar tak), ya `/reset` karein.*"
+                "📸 **Fidelity:** 100% Real Skin Pores & Exact Face Match\n\n"
+                "💡 *Nayi photo ke liye prompt bhejein, `/ratio` se size badlein, ya `/reset` karein.*"
             )
             with open(output_image_path, "rb") as img_f:
                 await update.message.reply_photo(photo=img_f, caption=caption_text, parse_mode="Markdown")
@@ -552,8 +587,8 @@ def main():
 
     print("========================================")
     print("🤖 Starting Uncensored Real DSLR Face Bot")
-    print("📦 Engine: FLUX.1-Dev + Smart Framing Engine")
-    print("💎 Fidelity: 100% Face Lock + Full Body / Waist Control")
+    print("📦 Engine: FLUX.1-Dev + Smart Hinglish Engine")
+    print("💎 Fidelity: 100% Face Match + Zero Restrictions")
     print(f"💾 Temp Directory: {TEMP_DIR}")
     print("========================================")
 
