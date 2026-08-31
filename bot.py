@@ -47,6 +47,9 @@ BASE_DIR = Path(__file__).resolve().parent
 TEMP_DIR = BASE_DIR / "temp"
 TEMP_DIR.mkdir(exist_ok=True)
 
+# In-memory client cache to prevent repeated 503 connection handshakes
+CLIENT_CACHE = {}
+
 # In-memory user state
 user_sessions = {}
 
@@ -67,7 +70,6 @@ RATIO_MAP = {
     "4:3": (4, 3),
 }
 
-# Dimension map for FLUX Engine
 FLUX_DIMENSIONS = {
     "1:1": (1024, 1024),
     "9:16": (896, 1152),
@@ -90,7 +92,7 @@ class KoyebHealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        return  # Suppress health check spam in logs
+        return
 
 def start_koyeb_health_server():
     """Starts background health check server for Koyeb on port 8000."""
@@ -116,10 +118,7 @@ def cleanup_old_files(max_age_hours=2):
         logger.warning(f"Error during temp cleanup: {e}")
 
 def create_high_res_face_crop(image_path: str, user_id: int) -> str:
-    """
-    Crops the face region to provide maximum pixel density
-    and micro-facial features (eyes, nose pin, lip contour) to the model.
-    """
+    """Crops the face region to provide maximum pixel density to the model."""
     try:
         with Image.open(image_path) as img:
             w, h = img.size
@@ -167,18 +166,36 @@ def apply_aspect_ratio(image_path: str, ratio_str: str) -> str:
         logger.warning(f"Error applying aspect ratio crop: {e}")
         return image_path
 
-def get_hf_client(space_name: str):
-    """Create Gradio client safely with token support across all versions."""
+def get_hf_client_with_retry(space_name: str, max_retries: int = 3):
+    """
+    Connects to a HuggingFace space with automatic retry and caching.
+    Handles waking up sleeping spaces (503 Service Unavailable).
+    """
+    if space_name in CLIENT_CACHE:
+        return CLIENT_CACHE[space_name]
+
     token = HF_TOKEN.strip() if (HF_TOKEN and len(HF_TOKEN.strip()) > 5) else None
-    if token:
+
+    for attempt in range(1, max_retries + 1):
         try:
-            return Client(space_name, token=token)
-        except TypeError:
-            try:
-                return Client(space_name, headers={"Authorization": f"Bearer {token}"})
-            except Exception:
-                return Client(space_name)
-    return Client(space_name)
+            logger.info(f"Connecting to space '{space_name}' (Attempt {attempt}/{max_retries})...")
+            if token:
+                try:
+                    c = Client(space_name, token=token)
+                except TypeError:
+                    c = Client(space_name, headers={"Authorization": f"Bearer {token}"})
+            else:
+                c = Client(space_name)
+            
+            CLIENT_CACHE[space_name] = c
+            logger.info(f"Connected and cached space: {space_name}")
+            return c
+        except Exception as e:
+            logger.warning(f"Connection attempt {attempt} for {space_name} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(3)  # Wait 3s for sleeping space container to spin up
+            else:
+                raise
 
 def build_dslr_prompt(user_prompt: str) -> str:
     """Enriches user prompt with ultra-realistic DSLR camera physics & skin pores."""
@@ -201,7 +218,7 @@ def build_dslr_negative_prompt() -> str:
 def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: str = "9:16") -> str:
     """
     Generates photo preserving 100% facial identity, natural skin pores,
-    and real body texture.
+    and real body texture with multi-engine failover.
     """
     logger.info(f"Generating realistic image for: {face_image_path} | prompt: '{prompt}' | ratio: '{ratio_str}'")
     
@@ -211,8 +228,8 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
 
     # 1. Primary Engine: FLUX.1 + PuLID
     try:
-        logger.info("Calling PuLID-FLUX engine for real skin & body fidelity...")
-        flux_client = get_hf_client("yanze/PuLID-FLUX")
+        logger.info("Calling PuLID-FLUX engine...")
+        flux_client = get_hf_client_with_retry("yanze/PuLID-FLUX", max_retries=3)
         res = flux_client.predict(
             prompt=enhanced_prompt,
             id_image=handle_file(face_image_path),
@@ -238,7 +255,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
         logger.warning(f"PuLID-FLUX encountered: {e}. Falling back to InstantID Photorealism...")
 
     # 2. Secondary Engine: InstantID Photorealism
-    instant_client = get_hf_client("InstantX/InstantID")
+    instant_client = get_hf_client_with_retry("InstantX/InstantID", max_retries=3)
     res = instant_client.predict(
         face_image_path=handle_file(face_image_path),
         pose_image_path=handle_file(face_image_path),
@@ -495,8 +512,10 @@ async def generate_image_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         error_str = str(e)
         if "quota" in error_str.lower() or "zerogpu" in error_str.lower():
             err_reply = "⚠️ **Hugging Face Free Quota Exceeded:** Kripya apne Koyeb environment me free `HF_TOKEN` add karein ya thodi der baad try karein."
+        elif "503" in error_str or "temporarily unavailable" in error_str.lower():
+            err_reply = "⚠️ **AI Space Waking Up:** Hugging Face Space abhi sleep mode se wake up ho raha hai. Kripya 15-20 seconds baad dobara prompt send karein!"
         elif "queue" in error_str.lower() or "busy" in error_str.lower():
-            err_reply = "⚠️ **GPU Queue Busy:** Server par queue chal rahi hai. Kripya 30 seconds baad dobara try karein."
+            err_reply = "⚠️ **GPU Queue Busy:** Server par thodi bheed hai. Kripya 30 seconds baad dobara try karein."
         else:
             err_reply = f"❌ **Error Aaya:** `{error_str[:150]}`\n\nKripya thodi der baad dobara prompt bhejein."
             
