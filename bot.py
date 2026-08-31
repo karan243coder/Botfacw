@@ -165,10 +165,10 @@ def apply_aspect_ratio(image_path: str, ratio_str: str) -> str:
         logger.warning(f"Error applying aspect ratio crop: {e}")
         return image_path
 
-def get_direct_hf_client(target_url: str):
+def get_direct_hf_client_with_retry(target_url: str, max_retries: int = 5):
     """
-    Directly connects to the space endpoint URL with browser headers.
-    Completely bypasses 503 redirection errors.
+    Directly connects to the space endpoint URL with browser headers and
+    5-step retry mechanism to allow containers to boot from sleep.
     """
     if target_url in CLIENT_CACHE:
         return CLIENT_CACHE[target_url]
@@ -178,19 +178,37 @@ def get_direct_hf_client(target_url: str):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    logger.info(f"Connecting directly to: {target_url}")
-    c = Client(
-        target_url,
-        token=token,
-        headers=headers,
-        httpx_kwargs={"timeout": 60.0}
-    )
-    CLIENT_CACHE[target_url] = c
-    return c
+    httpx_kwargs = {
+        "timeout": 60.0,
+        "follow_redirects": True,
+    }
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Connecting to {target_url} (Attempt {attempt}/{max_retries})...")
+            c = Client(
+                target_url,
+                token=token,
+                headers=headers,
+                httpx_kwargs=httpx_kwargs
+            )
+            CLIENT_CACHE[target_url] = c
+            logger.info(f"Connected and cached: {target_url}")
+            return c
+        except Exception as e:
+            logger.warning(f"Attempt {attempt} for {target_url} encountered: {e}")
+            if attempt < max_retries:
+                time.sleep(4)  # Wait 4s for space container boot
+            else:
+                raise
 
 # ----------------- Hinglish AI Prompt Engine -----------------
 def translate_hinglish_to_dslr_prompt(user_prompt: str) -> str:
@@ -280,7 +298,7 @@ def build_uncensored_negative_prompt() -> str:
 
 def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: str = "9:16") -> str:
     """
-    Direct endpoint failover: InstantID -> PuLID-FLUX -> PhotoMaker-V2
+    Direct endpoint failover with 5-step boot retry: InstantID -> PuLID-FLUX -> PhotoMaker-V2
     """
     logger.info(f"Generating realistic image for: {face_image_path} | prompt: '{prompt}' | ratio: '{ratio_str}'")
     
@@ -290,10 +308,10 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
 
     logger.info(f"Hinglish Translated Prompt: {enhanced_prompt}")
 
-    # 1. Primary Engine: InstantID Direct (Ultra-Reliable & Fast)
+    # 1. Primary Engine: InstantID Direct (Fast & 100% Face Match)
     try:
         logger.info("Calling Direct InstantID engine...")
-        instant_client = get_direct_hf_client("https://instantx-instantid.hf.space")
+        instant_client = get_direct_hf_client_with_retry("https://instantx-instantid.hf.space", max_retries=5)
         res = instant_client.predict(
             face_image_path=handle_file(face_image_path),
             pose_image_path=handle_file(face_image_path),
@@ -324,7 +342,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
 
     # 2. Secondary Engine: PuLID-FLUX Direct
     try:
-        flux_client = get_direct_hf_client("https://yanze-pulid-flux.hf.space")
+        flux_client = get_direct_hf_client_with_retry("https://yanze-pulid-flux.hf.space", max_retries=5)
         res = flux_client.predict(
             prompt=enhanced_prompt,
             id_image=handle_file(face_image_path),
@@ -350,7 +368,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
         logger.warning(f"Direct PuLID-FLUX encountered: {e}. Trying PuLID SDXL...")
 
     # 3. Tertiary Engine: PuLID SDXL Direct
-    pulid_sdxl = get_direct_hf_client("https://yanze-pulid.hf.space")
+    pulid_sdxl = get_direct_hf_client_with_retry("https://yanze-pulid.hf.space", max_retries=3)
     res = pulid_sdxl.predict(
         param_0=handle_file(face_image_path),
         param_1=handle_file(face_image_path),
