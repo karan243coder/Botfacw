@@ -6,6 +6,7 @@ import asyncio
 import logging
 import threading
 import re
+import urllib.request
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from PIL import Image
@@ -104,6 +105,29 @@ def start_koyeb_health_server():
     except Exception as e:
         logger.warning(f"Could not start Koyeb health server on port {port}: {e}")
 
+# ----------------- Space Keep-Alive Background Worker -----------------
+def space_keepalive_worker():
+    """Periodically pings HuggingFace spaces so they never go to sleep / return 503."""
+    spaces_to_warm = [
+        "https://yanze-pulid-flux.hf.space/config",
+        "https://instantx-instantid.hf.space/config"
+    ]
+    time.sleep(5)  # Wait for startup
+    while True:
+        for url in spaces_to_warm:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    pass
+            except Exception:
+                pass
+        time.sleep(300)  # Ping every 5 minutes
+
+def start_keepalive_thread():
+    t = threading.Thread(target=space_keepalive_worker, daemon=True)
+    t.start()
+    logger.info("AI Spaces Keep-Alive Background Worker started.")
+
 # ----------------- Helper Functions -----------------
 def cleanup_old_files(max_age_hours=2):
     now = time.time()
@@ -164,8 +188,8 @@ def apply_aspect_ratio(image_path: str, ratio_str: str) -> str:
         logger.warning(f"Error applying aspect ratio crop: {e}")
         return image_path
 
-def get_hf_client_with_retry(space_name: str, max_retries: int = 3):
-    """Connects to HuggingFace space with retry mechanism."""
+def get_hf_client_with_retry(space_name: str, max_retries: int = 5):
+    """Connects to HuggingFace space with 5-step retry mechanism to allow containers to boot."""
     if space_name in CLIENT_CACHE:
         return CLIENT_CACHE[space_name]
 
@@ -186,9 +210,9 @@ def get_hf_client_with_retry(space_name: str, max_retries: int = 3):
             logger.info(f"Connected and cached space: {space_name}")
             return c
         except Exception as e:
-            logger.warning(f"Connection attempt {attempt} for {space_name} failed: {e}")
+            logger.warning(f"Connection attempt {attempt} for {space_name} encountered: {e}")
             if attempt < max_retries:
-                time.sleep(3)
+                time.sleep(5)  # Allow 5s for the container to finish booting
             else:
                 raise
 
@@ -261,7 +285,6 @@ def translate_hinglish_to_dslr_prompt(user_prompt: str) -> str:
     
     translated_subject = re.sub(r'\s+', ' ', translated_subject).strip()
 
-    # Final prompt combines user intent with real human physics
     final_prompt = (
         f"raw color 8k photograph, exact 100% real life DSLR photography of the woman in reference, "
         f"{framing}, {translated_subject}, "
@@ -282,7 +305,7 @@ def build_uncensored_negative_prompt() -> str:
 def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: str = "9:16") -> str:
     """
     Generates uncensored photo preserving 100% facial identity, natural skin pores,
-    real body texture, and exact Hinglish prompt intent.
+    real body texture, and exact Hinglish prompt intent with multi-engine failover.
     """
     logger.info(f"Generating realistic image for: {face_image_path} | prompt: '{prompt}' | ratio: '{ratio_str}'")
     
@@ -295,7 +318,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
     # 1. Primary Engine: FLUX.1 + PuLID (Maximum Fidelity 1.40x)
     try:
         logger.info("Calling PuLID-FLUX engine with maximum identity weight (1.40)...")
-        flux_client = get_hf_client_with_retry("yanze/PuLID-FLUX", max_retries=3)
+        flux_client = get_hf_client_with_retry("yanze/PuLID-FLUX", max_retries=5)
         res = flux_client.predict(
             prompt=enhanced_prompt,
             id_image=handle_file(face_image_path),
@@ -306,7 +329,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
             width=w,
             height=h,
             num_steps=28,
-            id_weight=1.40,  # Maximum face identity lock
+            id_weight=1.40,
             neg_prompt=negative_prompt,
             timestep_to_start_cfg=1.0,
             max_sequence_length=512,
@@ -321,7 +344,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
         logger.warning(f"PuLID-FLUX encountered: {e}. Falling back to InstantID Photorealism...")
 
     # 2. Secondary Engine: InstantID Photorealism (IdentityNet 1.25x)
-    instant_client = get_hf_client_with_retry("InstantX/InstantID", max_retries=3)
+    instant_client = get_hf_client_with_retry("InstantX/InstantID", max_retries=5)
     res = instant_client.predict(
         face_image_path=handle_file(face_image_path),
         pose_image_path=handle_file(face_image_path),
@@ -329,8 +352,8 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
         negative_prompt=negative_prompt,
         style_name="(No style)",
         num_steps=35,
-        identitynet_strength_ratio=1.25,  # Strong 1:1 facial identity lock
-        adapter_strength_ratio=1.05,      # Deep facial semantic preservation
+        identitynet_strength_ratio=1.25,
+        adapter_strength_ratio=1.05,
         canny_strength=0.0,
         depth_strength=0.0,
         controlnet_selection=[],
@@ -367,7 +390,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Aap seedhe Hinglish me likh sakte hain — bot automatically samajh kar execute karega!\n\n"
         "• *Full Body:* `full body photo khadi hui bikini me`\n"
         "• *Kamar Tak:* `kamar tak photo red dress me seductive pose`\n"
-        "• *Cosplay / Creative:* `bunny cosplay pehna do luxury bedroom me`\n"
+        "• *Cosplay / Creative:* `sexy lingerie pehna do luxury bedroom me`\n"
         "• *100% Face Lock:* Aankhein, naak, bindi, lips exact wahi rahenge.\n"
         "• *Zero Restrictions:* Koi prompt block nahi hoga!\n\n"
         "🚀 **Kaise use karein?**\n"
@@ -476,7 +499,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             "✅ **Face & Micro-Features Successfully Saved!**\n\n"
             "Ab bataiye kaisa photo chahiye? (Seedhe Hinglish me likhein):\n"
             "• *Example:* `full body photo sexy bunny cosplay me khadi hui`\n"
-            "• *Example:* `kamar tak photo red saree me seductive pose`\n\n"
+            "• *Example:* `kamar tak photo sexy lingerie me alluring pose`\n\n"
             "📐 Ratio badalne ke liye `/ratio` dabayein.",
             parse_mode="Markdown"
         )
@@ -592,8 +615,13 @@ def main():
     print(f"💾 Temp Directory: {TEMP_DIR}")
     print("========================================")
 
+    # 1. Start Koyeb health server on port 8000
     start_koyeb_health_server()
 
+    # 2. Start Space Keep-Alive background worker
+    start_keepalive_thread()
+
+    # 3. Start Telegram Bot polling
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
