@@ -4,7 +4,9 @@ import time
 import shutil
 import asyncio
 import logging
+import threading
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from PIL import Image
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -33,6 +35,10 @@ logger = logging.getLogger("UltraRealFaceBot")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
+if HF_TOKEN and len(HF_TOKEN.strip()) > 5:
+    os.environ["HF_TOKEN"] = HF_TOKEN.strip()
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN.strip()
+
 if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN is missing! Please set it in .env or environment variables.")
 
@@ -42,7 +48,6 @@ TEMP_DIR = BASE_DIR / "temp"
 TEMP_DIR.mkdir(exist_ok=True)
 
 # In-memory user state
-# Schema: { user_id: { "face_path": str, "crop_path": str, "ratio": str, "last_active": float } }
 user_sessions = {}
 
 # Available aspect ratios
@@ -71,6 +76,34 @@ FLUX_DIMENSIONS = {
     "4:3": (1152, 896),
 }
 
+# ----------------- Koyeb Health Check Server -----------------
+class KoyebHealthCheckHandler(BaseHTTPRequestHandler):
+    """Responds 200 OK to Koyeb TCP/HTTP Health Checks on port 8000."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - Face Bot is running healthy!\n")
+    
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return  # Suppress health check spam in logs
+
+def start_koyeb_health_server():
+    """Starts background health check server for Koyeb on port 8000."""
+    port = int(os.getenv("PORT", 8000))
+    try:
+        server = HTTPServer(("0.0.0.0", port), KoyebHealthCheckHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"Koyeb Health Check server listening on port {port} (TCP Check Fix Active)")
+    except Exception as e:
+        logger.warning(f"Could not start Koyeb health server on port {port}: {e}")
+
+# ----------------- Helper Functions -----------------
 def cleanup_old_files(max_age_hours=2):
     """Clean up temporary images to prevent memory/disk overflow on Koyeb."""
     now = time.time()
@@ -84,21 +117,18 @@ def cleanup_old_files(max_age_hours=2):
 
 def create_high_res_face_crop(image_path: str, user_id: int) -> str:
     """
-    Crops the face and shoulder region to provide maximum pixel density
+    Crops the face region to provide maximum pixel density
     and micro-facial features (eyes, nose pin, lip contour) to the model.
     """
     try:
         with Image.open(image_path) as img:
             w, h = img.size
-            
-            # Smart vertical crop centered on top-middle region where face is located
             crop_left = int(w * 0.15)
             crop_top = int(h * 0.10)
             crop_right = int(w * 0.90)
             crop_bottom = int(h * 0.70)
             
             cropped = img.crop((crop_left, crop_top, crop_right, crop_bottom))
-            
             crop_output_path = str(TEMP_DIR / f"crop_{user_id}_{int(time.time())}.jpg")
             cropped.save(crop_output_path, quality=98)
             return crop_output_path
@@ -138,16 +168,20 @@ def apply_aspect_ratio(image_path: str, ratio_str: str) -> str:
         return image_path
 
 def get_hf_client(space_name: str):
-    """Create Gradio client with optional HuggingFace token."""
-    if HF_TOKEN and len(HF_TOKEN.strip()) > 5:
-        return Client(space_name, hf_token=HF_TOKEN.strip())
+    """Create Gradio client safely with token support across all versions."""
+    token = HF_TOKEN.strip() if (HF_TOKEN and len(HF_TOKEN.strip()) > 5) else None
+    if token:
+        try:
+            return Client(space_name, token=token)
+        except TypeError:
+            try:
+                return Client(space_name, headers={"Authorization": f"Bearer {token}"})
+            except Exception:
+                return Client(space_name)
     return Client(space_name)
 
 def build_dslr_prompt(user_prompt: str) -> str:
-    """
-    Enriches user prompt with ultra-realistic DSLR camera physics,
-    natural human skin pores, and real body anatomy details.
-    """
+    """Enriches user prompt with ultra-realistic DSLR camera physics & skin pores."""
     return (
         f"raw color 8k photograph, real life DSLR photography of the exact person in reference, "
         f"{user_prompt}, "
@@ -166,7 +200,7 @@ def build_dslr_negative_prompt() -> str:
 
 def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: str = "9:16") -> str:
     """
-    Generates ultra-realistic photo preserving 100% facial identity, natural skin pores,
+    Generates photo preserving 100% facial identity, natural skin pores,
     and real body texture.
     """
     logger.info(f"Generating realistic image for: {face_image_path} | prompt: '{prompt}' | ratio: '{ratio_str}'")
@@ -175,7 +209,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
     enhanced_prompt = build_dslr_prompt(prompt)
     negative_prompt = build_dslr_negative_prompt()
 
-    # 1. Primary Engine: FLUX.1 + PuLID (Nano Banana / Seedream Photorealism)
+    # 1. Primary Engine: FLUX.1 + PuLID
     try:
         logger.info("Calling PuLID-FLUX engine for real skin & body fidelity...")
         flux_client = get_hf_client("yanze/PuLID-FLUX")
@@ -188,7 +222,7 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
             true_cfg=1.0,
             width=w,
             height=h,
-            num_steps=26,
+            num_steps=24,
             id_weight=1.20,
             neg_prompt=negative_prompt,
             timestep_to_start_cfg=1.0,
@@ -248,8 +282,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Main ek **Ultra-Realistic DSLR AI Studio Bot** hu jo Seedream & Nano Banana Pro jaisi "
         "**100% Original Real Skin Pores, Real Body Texture aur Exact Facial Identity** ke sath images banata hai!\n\n"
         "⚡ **Khaasiyat:**\n"
-        "• **100% Real Skin Texture:** Visible skin pores, real lighting, 0% plastic/doll look.\n"
-        "• **Real Body Anatomy:** Accurate hands, neck, real fabric textures (silk, leather, cotton).\n"
+        "• **100% Real Skin Texture:** Visible skin pores, real lighting, 0% plastic look.\n"
+        "• **Real Body Anatomy:** Accurate hands, neck, real fabric textures (silk, leather, etc.).\n"
         "• **Dress & Pose Transformation:** Bunny cosplay, royal saree, western dresses, alluring/dynamic poses.\n"
         "• **HD Ratios:** 9:16 (Reels/Shorts), 16:9 (Landscape), 1:1 (DP), 3:4, 4:3.\n\n"
         "🚀 **Kaise use karein?**\n"
@@ -349,7 +383,6 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user_face_file = TEMP_DIR / f"face_{user_id}_{int(time.time())}.jpg"
     await photo_file.download_to_drive(custom_path=str(user_face_file))
     
-    # Automatically generate high-res face crop for micro-detail extraction
     crop_path = create_high_res_face_crop(str(user_face_file), user_id)
 
     if user_id not in user_sessions:
@@ -486,6 +519,10 @@ def main():
     print(f"💾 Temp Directory: {TEMP_DIR}")
     print("========================================")
 
+    # 1. Start background health check server for Koyeb
+    start_koyeb_health_server()
+
+    # 2. Start Telegram Bot polling
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     # Command Handlers
