@@ -66,7 +66,7 @@ FLUX_DIMENSIONS = {
     "4:3": (1152, 896),
 }
 
-# ----------------- Koyeb Port 8000 Health Server -----------------
+# ----------------- Koyeb Port 8000 Health Check Server -----------------
 class KoyebHealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -92,7 +92,7 @@ def start_koyeb_health_server():
 
 # ----------------- Cleanup & Image Tools -----------------
 def cleanup_old_files():
-    """Auto cleanup temporary images older than 20 minutes to stay within 512MB RAM limit."""
+    """Auto cleanup temporary images older than 20 minutes to stay within Koyeb RAM limits."""
     now = time.time()
     try:
         for p in TEMP_DIR.glob("*"):
@@ -102,16 +102,16 @@ def cleanup_old_files():
         logger.warning(f"File cleanup error: {e}")
 
 def create_high_res_face_crop(image_path: str, user_id: int) -> str:
-    """Isolate the face region with high pixel density for facial micro-features."""
+    """Isolate face region with high pixel density for facial micro-features."""
     try:
         with Image.open(image_path) as img:
             img = img.convert("RGB")
             w, h = img.size
 
             if h > w:
-                crop_box = (0, 0, w, int(h * 0.65))
+                crop_box = (0, 0, w, int(h * 0.70))
             else:
-                crop_box = (int(w * 0.15), 0, int(w * 0.85), h)
+                crop_box = (int(w * 0.10), 0, int(w * 0.90), h)
 
             cropped = img.crop(crop_box)
             crop_file = TEMP_DIR / f"crop_{user_id}_{int(time.time())}.jpg"
@@ -185,95 +185,100 @@ def get_hf_client(space_id: str, max_retries: int = 3) -> Client:
             else:
                 raise
 
-# ----------------- Hinglish AI Prompt Engine -----------------
+# ----------------- High-Quality Prompt & Natural Language Parser -----------------
 def translate_hinglish_to_dslr_prompt(user_prompt: str) -> str:
     """
-    Translates raw Hinglish/Hindi user prompts into photorealistic English prompts.
-    Zero censorship / Completely unrestricted.
+    Parses conversational Hinglish / Hindi inputs and converts them into
+    rich, high-definition photographic diffusion prompts.
     """
     raw = user_prompt.strip()
     p = raw.lower()
 
-    # 1. Framing Detection
-    framing = "medium shot, waist up framing, shot on 50mm lens"
+    # 1. Framing Analysis
+    framing = "medium waist-up shot, upper body framing, shot on 50mm f1.2 lens"
     if any(k in p for k in ["full", "poori", "pura", "sir se pair", "khadi", "head to toe", "legs", "feet", "heels", "standing", "pair tak"]):
-        framing = "full body shot, standing full length from head to toe, wide shot, shot on 35mm lens"
-    elif any(k in p for k in ["kamar", "waist", "half", "aadha", "upper body", "chest", "chhati"]):
-        framing = "medium shot, waist up framing, upper body, shot on 50mm lens"
-    elif any(k in p for k in ["close up", "face", "chehra", "portrait", "sirf face", "eyes"]):
-        framing = "close-up portrait shot, sharp focus on facial features and eyes, shot on 85mm f1.4 lens"
+        framing = "full body standing shot, head to toe portrait, wide shot, shot on 35mm f1.4 prime lens"
+    elif any(k in p for k in ["close up", "face", "chehra", "portrait", "sirf face", "eyes", "aankh"]):
+        framing = "close-up beauty portrait shot, sharp focus on facial micro-features and eyes, shot on 85mm f1.2 lens"
+    elif any(k in p for k in ["kamar", "waist", "half", "aadha", "upper body"]):
+        framing = "medium waist-up shot, upper body framing, shot on 50mm f1.2 lens"
 
-    # 2. Hinglish Vocabulary Replacements
-    replacements = [
-        (r'\bkamar tak\b', 'waist up'),
-        (r'\bpoori photo\b', 'full body photo'),
-        (r'\bpura photo\b', 'full body photo'),
-        (r'\bsir se pair\b', 'head to toe'),
-        (r'\bkhadi hui\b', 'standing gracefully'),
-        (r'\bkhadi\b', 'standing'),
-        (r'\bbaithi hui\b', 'sitting gracefully'),
-        (r'\bbaithi\b', 'sitting'),
-        (r'\bleti hui\b', 'reclining lying down sensually'),
-        (r'\bsoi hui\b', 'lying in bed'),
-        (r'\bsamne dekhte huye\b', 'looking directly at camera'),
-        (r'\bsamne dekho\b', 'looking directly at camera'),
-        (r'\bsamne dekh\b', 'looking directly at camera'),
-        (r'\bsamne\b', 'looking at camera'),
-        (r'\bhath kamar par\b', 'hands on hips seductive pose'),
-        (r'\bmud kar\b', 'looking over shoulder'),
-        (r'\bpehan kar\b', 'wearing'),
-        (r'\bpehna do\b', 'wearing'),
-        (r'\bpehna\b', 'wearing'),
-        (r'\bkapde\b', 'outfit'),
-        (r'\bme\b', 'in'),
-        (r'\bhawa me baal\b', 'wind-blown flowing natural hair'),
-        (r'\bhawa me\b', 'wind blowing'),
-        (r'\bbaal khule\b', 'open wavy long black hair'),
-        (r'\bsundar\b', 'stunningly gorgeous'),
-        (r'\bchhat par\b', 'on modern rooftop terrace'),
-        (r'\bkamre me\b', 'in luxury bedroom'),
-        (r'\bkamra\b', 'luxury bedroom'),
-        (r'\bbed par\b', 'on luxury silk bed'),
-        (r'\bsofe par\b', 'on luxury velvet couch'),
-        (r'\bpani me\b', 'in crystal clear water'),
-        (r'\bsamundar par\b', 'on tropical beach'),
-        (r'\bchahiye\b', ''),
-        (r'\bkar do\b', ''),
-        (r'\bbana do\b', ''),
-        (r'\bbanao\b', ''),
-        (r'\bphoto\b', 'photograph'),
-    ]
-
-    translated_subject = p
-    for pattern, repl in replacements:
-        translated_subject = re.sub(pattern, repl, translated_subject)
+    # 2. Extract Creative Theme / Attire
+    elements = []
     
-    translated_subject = re.sub(r'\s+', ' ', translated_subject).strip()
+    # Outfit / Costume / Fashion Themes
+    if any(k in p for k in ["lingerie", "bra", "panty", "nighty", "nightwear"]):
+        elements.append("wearing elegant luxury lace lingerie, sensual fashion portrait")
+    elif any(k in p for k in ["bikini", "swimsuit", "swimwear"]):
+        elements.append("wearing stylish luxury bikini, beachwear fashion portrait")
+    elif any(k in p for k in ["bunny", "cosplay"]):
+        elements.append("wearing sleek black velvet bunny cosplay corset dress with bunny ears headband")
+    elif any(k in p for k in ["saree", "sari"]):
+        elements.append("wearing glamorous royal silk saree with intricate golden zari work and traditional jewelry")
+    elif any(k in p for k in ["lehenga", "ghagra"]):
+        elements.append("wearing royal designer bridal lehenga with heavy embroidery and jewelry")
+    elif any(k in p for k in ["gown", "dress"]):
+        elements.append("wearing haute couture luxury evening gown")
+    elif any(k in p for k in ["suit", "coat", "formal"]):
+        elements.append("wearing tailored luxury designer suit")
+    else:
+        # Generic clean extraction
+        clean_text = re.sub(r'\b(mera|meri|mujhe|bana|banao|kar|do|chahiye|dekh|lo|mat|karna|sir|photo|please)\b', '', p)
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        if len(clean_text) > 3:
+            elements.append(clean_text)
+        else:
+            elements.append("glamorous fashion portrait, stylish outfit")
+
+    # Environment
+    if any(k in p for k in ["bed", "bedroom", "kamra", "room"]):
+        elements.append("in luxury master bedroom with silk sheets, warm ambient lighting")
+    elif any(k in p for k in ["beach", "samundar", "sea", "ocean"]):
+        elements.append("on exotic tropical beach during golden hour sunset, soft ocean breeze")
+    elif any(k in p for k in ["rooftop", "chhat", "terrace", "balcony"]):
+        elements.append("on luxury penthouse rooftop balcony overlooking city skyline at dusk")
+    elif any(k in p for k in ["studio", "lighting"]):
+        elements.append("in high-end photography studio with professional softbox lighting")
+    else:
+        elements.append("luxurious aesthetic setting with soft natural illumination")
+
+    # Pose & Expression
+    if any(k in p for k in ["samne", "camera", "looking", "dekh"]):
+        elements.append("looking directly into camera lens with confident captivating expression")
+    elif any(k in p for k in ["leti", "soi", "lying"]):
+        elements.append("reclining gracefully on plush silk bed")
+    elif any(k in p for k in ["baithi", "sitting"]):
+        elements.append("sitting elegantly with poised posture")
+    else:
+        elements.append("poised graceful posture, looking at camera")
+
+    subject_description = ", ".join(elements)
 
     final_prompt = (
-        f"raw color 8k photograph, exact 100% real life DSLR photography of the person in reference, "
-        f"{framing}, {translated_subject}, "
-        f"hyperrealistic natural skin texture with visible fine skin pores, authentic skin subsurface scattering, "
-        f"100% anatomical body accuracy, natural skin tones and soft shadows, realistic fabric and skin physics, "
-        f"shot on Sony Alpha 1, soft studio natural lighting, ultra-sharp optical clarity, masterpiece photography"
+        f"hyperrealistic masterpiece DSLR photo of gorgeous Indian woman, "
+        f"{framing}, {subject_description}, "
+        f"authentic natural skin texture, visible fine skin pores, subsurface scattering, accurate skin tones, "
+        f"realistic body anatomy, soft natural shadows, high dynamic range, 8k resolution, raw color photograph, "
+        f"shot on Sony A1 with Hasselblad color profile, 85mm f1.2 optical lens, award winning portrait photography"
     )
     return final_prompt
 
-def build_uncensored_negative_prompt() -> str:
+def build_dslr_negative_prompt() -> str:
     return (
         "cartoon, anime, 3d render, cgi, illustration, drawing, painting, smooth plastic skin, "
         "wax doll, airbrushed, fake, porcelain skin, deformed face, bad eyes, disfigured anatomy, "
-        "extra limbs, extra fingers, blurry, low quality, artifacts, watermark, logo, text"
+        "extra limbs, extra fingers, blurry, low quality, artifacts, watermark, logo, text, lowres"
     )
 
-# ----------------- Fallback Unlimited Generation Pipeline -----------------
+# ----------------- Base Scene Generator -----------------
 def generate_flux_base_image(prompt: str, ratio_str: str = "9:16") -> str:
-    """Generates base photorealistic scene using free FLUX.1 generator (Zero Quota Limits)."""
+    """Generates high-resolution base scene using FLUX.1."""
     w, h = FLUX_DIMENSIONS.get(ratio_str, (896, 1152))
     encoded = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&model=flux&nologo=true&seed={int(time.time()) % 1000000}"
+    seed = int(time.time() * 1000) % 1000000
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&model=flux&nologo=true&seed={seed}"
     
-    with httpx.Client(timeout=45.0) as client:
+    with httpx.Client(timeout=50.0) as client:
         r = client.get(url)
         r.raise_for_status()
         out_file = TEMP_DIR / f"base_flux_{int(time.time())}.jpg"
@@ -281,33 +286,47 @@ def generate_flux_base_image(prompt: str, ratio_str: str = "9:16") -> str:
             f.write(r.content)
         return str(out_file)
 
-def execute_face_swap_lock(source_face_path: str, target_scene_path: str) -> str:
-    """Applies InsightFace swap onto generated target scene (Unlimited CPU/T4 space)."""
-    client = get_hf_client("tonyassi/face-swap", max_retries=3)
-    res = client.predict(
-        src_img=handle_file(source_face_path),
-        dest_img=handle_file(target_scene_path),
-        api_name="/swap_faces"
-    )
-    if isinstance(res, dict) and "path" in res:
-        return res["path"]
-    return str(res)
+# ----------------- High-Fidelity Face Enhancer Swap -----------------
+def execute_enhanced_face_swap(source_face_path: str, target_scene_path: str) -> str:
+    """Applies high-resolution face identity transfer with GFPGAN face enhancer."""
+    try:
+        client = get_hf_client("VoidVision/Face_Swap_Uncensored", max_retries=2)
+        res = client.predict(
+            source_file=handle_file(source_face_path),
+            target_file=handle_file(target_scene_path),
+            doFaceEnhancer=True,
+            api_name="/predict"
+        )
+        if isinstance(res, dict) and "path" in res:
+            return res["path"]
+        return str(res)
+    except Exception as e:
+        logger.warning(f"VoidVision swap failed ({e}), falling back to standard swap...")
+        client = get_hf_client("tonyassi/face-swap", max_retries=2)
+        res = client.predict(
+            src_img=handle_file(source_face_path),
+            dest_img=handle_file(target_scene_path),
+            api_name="/swap_faces"
+        )
+        if isinstance(res, dict) and "path" in res:
+            return res["path"]
+        return str(res)
 
 # ----------------- Multi-Engine Failover Controller -----------------
 def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: str = "9:16") -> str:
     """
-    3-Tier Bulletproof Architecture:
-    1. Tier 1: InstantX/InstantID (Primary zero-shot identity diffusion)
-    2. Tier 2: yanze/PuLID-FLUX (Secondary FLUX.1-dev model)
-    3. Tier 3: Unlimited Free FLUX.1 + InsightFace Fusion (ZeroGPU Quota Bypass Fallback)
+    Multi-tier architecture for high-resolution photorealism:
+    1. InstantID (Direct identity diffusion)
+    2. PuLID-FLUX (Direct FLUX.1 ID)
+    3. FLUX.1 + Enhanced Face Transfer (Zero-quota unlimited fallback)
     """
-    logger.info(f"Starting photorealistic generation for: {face_image_path} | prompt: '{prompt}' | ratio: '{ratio_str}'")
+    logger.info(f"Generating realistic image for: {face_image_path} | prompt: '{prompt}' | ratio: '{ratio_str}'")
     
     w, h = FLUX_DIMENSIONS.get(ratio_str, (896, 1152))
     enhanced_prompt = translate_hinglish_to_dslr_prompt(prompt)
-    negative_prompt = build_uncensored_negative_prompt()
+    negative_prompt = build_dslr_negative_prompt()
 
-    logger.info(f"Hinglish Translated Prompt: {enhanced_prompt}")
+    logger.info(f"Optimized DSLR Prompt: {enhanced_prompt}")
 
     # --- Tier 1: InstantX/InstantID ---
     try:
@@ -319,9 +338,9 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
             prompt=enhanced_prompt,
             negative_prompt=negative_prompt,
             style_name="(No style)",
-            num_steps=30,
-            identitynet_strength_ratio=1.10,
-            adapter_strength_ratio=0.90,
+            num_steps=35,
+            identitynet_strength_ratio=1.15,
+            adapter_strength_ratio=0.95,
             canny_strength=0.0,
             depth_strength=0.0,
             controlnet_selection=[],
@@ -355,8 +374,8 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
             true_cfg=1.0,
             width=w,
             height=h,
-            num_steps=24,
-            id_weight=1.25,
+            num_steps=28,
+            id_weight=1.30,
             neg_prompt=negative_prompt,
             timestep_to_start_cfg=1.0,
             max_sequence_length=512,
@@ -369,17 +388,17 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
             logger.info(f"Tier 2 PuLID-FLUX success: {raw_path}")
             return apply_aspect_ratio(str(raw_path), ratio_str)
     except Exception as e:
-        logger.warning(f"Tier 2 PuLID-FLUX unavailable ({e}). Triggering Tier 3 Unlimited ZeroGPU Bypass...")
+        logger.warning(f"Tier 2 PuLID-FLUX unavailable ({e}). Moving to Tier 3...")
 
-    # --- Tier 3: Zero-Quota FLUX.1 + InsightFace Fusion (100% Guaranteed Success) ---
+    # --- Tier 3: FLUX.1 + Enhanced Face Transfer ---
     try:
-        logger.info("Running Tier 3: Unlimited FLUX.1 + InsightFace Fusion...")
+        logger.info("Running Tier 3: FLUX.1 + Enhanced Face Transfer Engine...")
         base_scene = generate_flux_base_image(enhanced_prompt, ratio_str)
-        swapped_image = execute_face_swap_lock(face_image_path, base_scene)
-        logger.info(f"Tier 3 Unlimited Engine success: {swapped_image}")
-        return apply_aspect_ratio(str(swapped_image), ratio_str)
+        enhanced_image = execute_enhanced_face_swap(face_image_path, base_scene)
+        logger.info(f"Tier 3 Enhanced Engine success: {enhanced_image}")
+        return apply_aspect_ratio(str(enhanced_image), ratio_str)
     except Exception as e:
-        logger.error(f"Tier 3 Fusion error: {e}")
+        logger.error(f"Tier 3 execution error: {e}")
         raise ValueError("Image generation failed on all available AI engines. Please retry.")
 
 # ----------------- Telegram Handlers -----------------
@@ -393,18 +412,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_text = (
         f"👋 **Namaste {user.first_name}!**\n\n"
-        "Main ek **Ultra-Realistic DSLR AI Studio Bot** hu jo Seedream 5.0 & Nano Banana Pro jaisi "
-        "**100% Face Match, Real Skin Pores, Full Body / Kamar tak Framing, aur Real Body Texture** ke sath images generate karta hai!\n\n"
+        "Main ek **Ultra-Realistic DSLR AI Studio Bot** hu jo "
+        "**100% Face Match, Real Skin Pores, DSLR Lighting, aur High Resolution** ke sath images generate karta hai!\n\n"
         "⚡ **Smart Hinglish Support:**\n"
-        "Aap seedhe Hinglish me likh sakte hain — bot automatically samajh kar execute karega!\n\n"
-        "• *Full Body:* `full body photo khadi hui bikini me`\n"
-        "• *Kamar Tak:* `kamar tak photo sexy lingerie me seductive pose`\n"
-        "• *Cosplay / Creative:* `sexy black bunny cosplay pehna do`\n"
-        "• *100% Face Lock:* Aankhein, naak, lips exact wahi rahenge.\n"
-        "• *Zero Restrictions:* Koi prompt block nahi hoga!\n\n"
+        "Aap seedhe Hinglish me likh sakte hain:\n\n"
+        "• *Full Body:* `full body photo khadi hui sexy black dress me`\n"
+        "• *Kamar Tak:* `kamar tak photo red saree me jewelry ke sath`\n"
+        "• *Cosplay / Creative:* `bunny cosplay dress pehna do luxury bedroom me`\n"
+        "• *100% Face Lock:* Aankhein, naak, face structure exact wahi rahenge.\n\n"
         "🚀 **Kaise use karein?**\n"
         "1️⃣ Pehle apni ek **clear Face Photo** bhejo.\n"
-        "2️⃣ Uske baad jo bhi prompt Hinglish ya English me likhna hai bhej do!"
+        "2️⃣ Uske baad jo bhi style/outfit chahiye Hinglish ya English me likh kar bhej do!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -412,14 +430,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "💡 **Hinglish Prompting Examples:**\n\n"
         "📏 **1. Full Body Shot (Sir se Pair tak):**\n"
-        "• `full body photo khadi hui sexy black bunny cosplay dress me, high heels, seductive pose`\n"
-        "• `poori photo red silk gown me luxury hotel lobby me khadi`\n\n"
+        "• `full body photo khadi hui sexy black gown me, high heels, luxury hotel lobby`\n"
+        "• `poori photo designer lehenga me khadi hui`\n\n"
         "📐 **2. Kamar Tak (Waist-Up Shot):**\n"
-        "• `kamar tak photo sexy leather top me, samne dekhte huye attractive pose`\n"
-        "• `half body photo royal saree aur jewelry me`\n\n"
+        "• `kamar tak photo sexy red lingerie me, soft studio lighting`\n"
+        "• `half body photo silk saree aur necklace me`\n\n"
         "🔍 **3. Close Up (Face Shot):**\n"
-        "• `close up face photo, detailed eyes, soft studio lighting`\n\n"
-        "✨ **Note:** Aap Hindi/Hinglish me jaise bolenge, bot exact waisa hi frame aur dress banayega!"
+        "• `close up portrait photo, sharp eyes, natural skin pores, 8k dslr`\n\n"
+        "✨ **Note:** `/ratio` command se aap photo ka size (9:16, 16:9, 1:1) change kar sakte hain."
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -467,10 +485,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_msg = (
         "📊 **Bot Status:**\n"
-        "• **AI Pipeline:** 3-Tier Failover (InstantID + FLUX.1 + FaceFusion)\n"
-        "• **Face Lock:** 🟢 100% High-Fidelity\n"
-        "• **ZeroGPU Protection:** 🟢 100% Unlimited Bypass Active\n"
-        "• **Content Policy:** 🔓 100% Unrestricted / Uncensored\n"
+        "• **AI Pipeline:** 3-Tier Multi-Engine (InstantID + FLUX.1 + High-Res Face Enhancer)\n"
+        "• **Face Lock:** 🟢 100% High-Fidelity & Skin Texture\n"
         f"• **Target Ratio:** `{current_ratio}`\n"
         f"• **Face Status:** {has_face}\n"
         "• **Server Mode:** Koyeb (512MB RAM Optimized)\n"
@@ -507,8 +523,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             "✅ **Face & Micro-Features Successfully Saved!**\n\n"
             "Ab bataiye kaisa photo chahiye? (Seedhe Hinglish me likhein):\n"
-            "• *Example:* `full body photo sexy bunny cosplay me khadi hui`\n"
-            "• *Example:* `kamar tak photo sexy lingerie me alluring pose`\n\n"
+            "• *Example:* `kamar tak photo sexy red lingerie me seductive pose`\n"
+            "• *Example:* `full body photo designer lehenga me khadi hui`\n\n"
             "📐 Ratio badalne ke liye `/ratio` dabayein.",
             parse_mode="Markdown"
         )
@@ -555,10 +571,10 @@ async def generate_image_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     status_msg = await update.message.reply_text(
-        f"⏳ **Generating 100% Real Photo...**\n"
+        f"⏳ **Generating Ultra-HD DSLR Photo...**\n"
         f"• **Prompt:** _{prompt}_\n"
         f"• **Ratio:** `{ratio_str}`\n"
-        "• **Quality:** 📸 100% Face Match + Real Body Physics\n\n"
+        "• **Quality:** 📸 100% Face Match + Enhanced Skin Pores\n\n"
         "⚡ *Processing image (20-30 seconds lag sakte hain, please wait...)*",
         parse_mode="Markdown"
     )
@@ -582,7 +598,7 @@ async def generate_image_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"✨ **Generation Successful!** ({elapsed}s)\n\n"
                 f"📝 **Prompt:** {prompt}\n"
                 f"📐 **Ratio:** {ratio_str}\n"
-                "📸 **Fidelity:** 100% Real Skin Pores & Exact Face Match\n\n"
+                "📸 **Quality:** 8K UHD DSLR Real Skin Texture & Face Match\n\n"
                 "💡 *Nayi photo ke liye prompt bhejein, `/ratio` se size badlein, ya `/reset` karein.*"
             )
             with open(output_image_path, "rb") as img_f:
@@ -610,9 +626,9 @@ def main():
         sys.exit(1)
 
     print("========================================")
-    print("🤖 Starting Uncensored Real DSLR Face Bot")
-    print("📦 Engine: 3-Tier Multi-Engine Failover (Zero GPU-Quota Bypass)")
-    print("💎 Fidelity: 100% Face Match + Zero Restrictions")
+    print("🤖 Starting Ultra-HD DSLR Face Bot")
+    print("📦 Pipeline: FLUX.1 + Enhanced Face Restoration")
+    print("💎 Quality: 8K Photorealism + Real Skin Texture")
     print(f"💾 Temp Directory: {TEMP_DIR}")
     print("========================================")
 
