@@ -1,14 +1,14 @@
 import os
 import sys
-import time
-import shutil
-import asyncio
 import logging
-import threading
+import time
+import asyncio
 import re
-import urllib.request
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+from typing import Dict, Any
+
 from PIL import Image
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -23,130 +23,127 @@ from telegram.ext import (
 )
 from gradio_client import Client, handle_file
 
-# Load environment variables
+# ----------------- Environment & Setup -----------------
 load_dotenv()
 
-# Setup logging
-logging.basicConfig(
-    format="%(asctime)s - [%(levelname)s] - %(name)s: %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger("UltraRealFaceBot")
-
-# Environment configurations
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-HF_TOKEN = os.getenv("HF_TOKEN", None)
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 if HF_TOKEN and len(HF_TOKEN.strip()) > 5:
     os.environ["HF_TOKEN"] = HF_TOKEN.strip()
     os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN.strip()
 
-if not TELEGRAM_TOKEN:
-    logger.error("TELEGRAM_TOKEN is missing! Please set it in .env or environment variables.")
+TEMP_DIR = Path("/tmp/face_bot_cache")
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Working directories
-BASE_DIR = Path(__file__).resolve().parent
-TEMP_DIR = BASE_DIR / "temp"
-TEMP_DIR.mkdir(exist_ok=True)
+# ----------------- Logging -----------------
+logging.basicConfig(
+    format="%(asctime)s - [%(levelname)s] - %(name)s: %(message)s",
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("UltraRealFaceBot")
 
-# In-memory client cache
-CLIENT_CACHE = {}
+# ----------------- State & Caching -----------------
+user_sessions: Dict[int, Dict[str, Any]] = {}
+CLIENT_CACHE: Dict[str, Client] = {}
 
-# In-memory user state
-user_sessions = {}
-
-# Available aspect ratios
 AVAILABLE_RATIOS = [
-    ("9:16", "📱 9:16 (Story / Reel / Shorts)"),
+    ("9:16", "📱 9:16 (Story / Reel / Portrait)"),
     ("16:9", "🖥️ 16:9 (Landscape / Wallpaper)"),
-    ("1:1", "📸 1:1 (Square / Instagram DP)"),
-    ("3:4", "🖼️ 3:4 (Portrait)"),
-    ("4:3", "📺 4:3 (Standard Photo)"),
+    ("1:1", "⏹️ 1:1 (Square / Instagram Post)"),
+    ("3:4", "📸 3:4 (Standard Portrait)"),
+    ("4:3", "🖼️ 4:3 (Standard Photo)"),
 ]
 
-RATIO_MAP = {
-    "1:1": (1, 1),
-    "9:16": (9, 16),
-    "16:9": (16, 9),
-    "3:4": (3, 4),
-    "4:3": (4, 3),
-}
-
 FLUX_DIMENSIONS = {
-    "1:1": (1024, 1024),
     "9:16": (896, 1152),
     "16:9": (1152, 896),
+    "1:1": (1024, 1024),
     "3:4": (896, 1152),
     "4:3": (1152, 896),
 }
 
-# ----------------- Koyeb Health Check Server -----------------
+# ----------------- Koyeb Port 8000 Health Check Server -----------------
 class KoyebHealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain")
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Face Bot is running healthy!\n")
-    
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        self.wfile.write(b"OK - UltraRealFaceBot is running healthy")
 
     def log_message(self, format, *args):
+        # Suppress noisy HTTP health logs
         return
 
-def start_koyeb_health_server():
-    port = int(os.getenv("PORT", 8000))
+def run_health_server():
     try:
-        server = HTTPServer(("0.0.0.0", port), KoyebHealthCheckHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        logger.info(f"Koyeb Health Check server listening on port {port}")
+        server_address = ("0.0.0.0", 8000)
+        httpd = HTTPServer(server_address, KoyebHealthCheckHandler)
+        logger.info("Koyeb TCP/HTTP Health Check Server active on 0.0.0.0:8000")
+        httpd.serve_forever()
     except Exception as e:
-        logger.warning(f"Could not start Koyeb health server on port {port}: {e}")
+        logger.warning(f"Health server error: {e}")
 
-# ----------------- Helper Functions -----------------
-def cleanup_old_files(max_age_hours=2):
+def start_koyeb_health_server():
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+
+# ----------------- Cleanup & Image Tools -----------------
+def cleanup_old_files():
+    """Auto cleanup temporary images older than 30 minutes to stay within Koyeb 512MB RAM limit."""
     now = time.time()
     try:
-        for file_path in TEMP_DIR.glob("*"):
-            if file_path.is_file():
-                if now - file_path.stat().st_mtime > (max_age_hours * 3600):
-                    file_path.unlink(missing_ok=True)
+        for p in TEMP_DIR.glob("*"):
+            if p.is_file() and (now - p.stat().st_mtime > 1800):
+                p.unlink(missing_ok=True)
     except Exception as e:
-        logger.warning(f"Error during temp cleanup: {e}")
+        logger.warning(f"File cleanup error: {e}")
 
 def create_high_res_face_crop(image_path: str, user_id: int) -> str:
-    """Crops the face region with high precision for micro-feature embedding."""
+    """
+    Crops the upper/center region of the uploaded image to focus
+    on facial micro-features (eyes, nose, skin texture) for optimal identityNet locking.
+    """
     try:
         with Image.open(image_path) as img:
+            img = img.convert("RGB")
             w, h = img.size
-            crop_left = int(w * 0.10)
-            crop_top = int(h * 0.08)
-            crop_right = int(w * 0.90)
-            crop_bottom = int(h * 0.75)
-            
-            cropped = img.crop((crop_left, crop_top, crop_right, crop_bottom))
-            crop_output_path = str(TEMP_DIR / f"crop_{user_id}_{int(time.time())}.jpg")
-            cropped.save(crop_output_path, quality=98)
-            return crop_output_path
+
+            # If image is tall portrait, isolate top 65% where head/face is located
+            if h > w:
+                crop_box = (0, 0, w, int(h * 0.65))
+            else:
+                crop_box = (int(w * 0.15), 0, int(w * 0.85), h)
+
+            cropped = img.crop(crop_box)
+            crop_file = TEMP_DIR / f"crop_{user_id}_{int(time.time())}.jpg"
+            cropped.save(crop_file, format="JPEG", quality=98)
+            logger.info(f"High-res face crop created: {crop_file} ({cropped.size})")
+            return str(crop_file)
     except Exception as e:
-        logger.warning(f"Face crop failed: {e}")
+        logger.warning(f"Face crop fallback to original image: {e}")
         return image_path
 
 def apply_aspect_ratio(image_path: str, ratio_str: str) -> str:
-    """Crop and format generated image to exact target aspect ratio."""
-    if ratio_str not in RATIO_MAP or ratio_str == "1:1":
-        return image_path
+    """Exact aspect ratio cropping engine using PIL."""
+    ratio_map = {
+        "9:16": 9 / 16,
+        "16:9": 16 / 9,
+        "1:1": 1.0,
+        "3:4": 3 / 4,
+        "4:3": 4 / 3,
+    }
+    target_ratio = ratio_map.get(ratio_str, 9 / 16)
 
     try:
         with Image.open(image_path) as img:
-            target_w_ratio, target_h_ratio = RATIO_MAP[ratio_str]
-            target_ratio = target_w_ratio / target_h_ratio
+            img = img.convert("RGB")
             w, h = img.size
             current_ratio = w / h
 
-            if abs(current_ratio - target_ratio) < 0.01:
+            # Check if crop is necessary (threshold > 2%)
+            if abs(current_ratio - target_ratio) < 0.02:
                 return image_path
 
             if current_ratio > target_ratio:
@@ -158,55 +155,41 @@ def apply_aspect_ratio(image_path: str, ratio_str: str) -> str:
                 offset = (h - new_h) // 2
                 cropped = img.crop((0, offset, w, offset + new_h))
 
-            output_ratio_path = str(Path(image_path).with_name(f"ratio_{Path(image_path).name}"))
-            cropped.save(output_ratio_path, quality=95)
+            output_ratio_path = str(Path(image_path).with_name(f"ratio_{Path(image_path).name}.jpg"))
+            cropped.save(output_ratio_path, format="JPEG", quality=96)
             return output_ratio_path
     except Exception as e:
-        logger.warning(f"Error applying aspect ratio crop: {e}")
+        logger.warning(f"Aspect ratio crop warning: {e}")
         return image_path
 
-def get_direct_hf_client_with_retry(target_url: str, max_retries: int = 5):
+# ----------------- Hugging Face Space Client Loader -----------------
+def get_hf_client(space_id: str, max_retries: int = 3) -> Client:
     """
-    Directly connects to the space endpoint URL with browser headers and
-    5-step retry mechanism to allow containers to boot from sleep.
+    Loads Gradio Client via official Space Repo ID (e.g. 'InstantX/InstantID', 'yanze/PuLID-FLUX').
+    Resolving by Space ID routes through Hugging Face's official API router,
+    avoiding Cloudflare/503 errors and waking up sleeping ZeroGPU containers.
     """
-    if target_url in CLIENT_CACHE:
-        return CLIENT_CACHE[target_url]
+    if space_id in CLIENT_CACHE:
+        return CLIENT_CACHE[space_id]
 
-    token = HF_TOKEN.strip() if (HF_TOKEN and len(HF_TOKEN.strip()) > 5) else None
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    httpx_kwargs = {
-        "timeout": 60.0,
-        "follow_redirects": True,
-    }
+    token = None
+    if HF_TOKEN and len(HF_TOKEN.strip()) > 5:
+        token = HF_TOKEN.strip()
 
     for attempt in range(1, max_retries + 1):
         try:
-            logger.info(f"Connecting to {target_url} (Attempt {attempt}/{max_retries})...")
-            c = Client(
-                target_url,
-                token=token,
-                headers=headers,
-                httpx_kwargs=httpx_kwargs
-            )
-            CLIENT_CACHE[target_url] = c
-            logger.info(f"Connected and cached: {target_url}")
-            return c
+            logger.info(f"Connecting to Hugging Face Space: '{space_id}' (Attempt {attempt}/{max_retries})...")
+            if token:
+                client = Client(space_id, token=token)
+            else:
+                client = Client(space_id)
+            CLIENT_CACHE[space_id] = client
+            logger.info(f"Successfully connected and cached: '{space_id}'")
+            return client
         except Exception as e:
-            logger.warning(f"Attempt {attempt} for {target_url} encountered: {e}")
+            logger.warning(f"Attempt {attempt} for '{space_id}' encountered: {e}")
             if attempt < max_retries:
-                time.sleep(4)  # Wait 4s for space container boot
+                time.sleep(3)
             else:
                 raise
 
@@ -280,7 +263,7 @@ def translate_hinglish_to_dslr_prompt(user_prompt: str) -> str:
     translated_subject = re.sub(r'\s+', ' ', translated_subject).strip()
 
     final_prompt = (
-        f"raw color 8k photograph, exact 100% real life DSLR photography of the woman in reference, "
+        f"raw color 8k photograph, exact 100% real life DSLR photography of the person in reference, "
         f"{framing}, {translated_subject}, "
         f"hyperrealistic natural skin texture with visible fine skin pores, authentic skin subsurface scattering, "
         f"100% anatomical body accuracy, natural skin tones and soft shadows, realistic fabric and skin physics, "
@@ -289,7 +272,7 @@ def translate_hinglish_to_dslr_prompt(user_prompt: str) -> str:
     return final_prompt
 
 def build_uncensored_negative_prompt() -> str:
-    """Permissive negative prompt focused exclusively on preventing CGI / cartoon artifacts."""
+    """Negative prompt focused strictly on preventing CGI / cartoon artifacts."""
     return (
         "cartoon, anime, 3d render, cgi, illustration, drawing, painting, smooth plastic skin, "
         "wax doll, airbrushed, fake, porcelain skin, deformed face, bad eyes, disfigured anatomy, "
@@ -298,7 +281,9 @@ def build_uncensored_negative_prompt() -> str:
 
 def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: str = "9:16") -> str:
     """
-    Direct endpoint failover with 5-step boot retry: InstantID -> PuLID-FLUX -> PhotoMaker-V2
+    Multi-engine failover pipeline:
+    1. Primary: InstantX/InstantID (High Face Fidelity, Fast & Reliable)
+    2. Secondary: yanze/PuLID-FLUX (FLUX.1-dev Photorealism)
     """
     logger.info(f"Generating realistic image for: {face_image_path} | prompt: '{prompt}' | ratio: '{ratio_str}'")
     
@@ -308,19 +293,19 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
 
     logger.info(f"Hinglish Translated Prompt: {enhanced_prompt}")
 
-    # 1. Primary Engine: InstantID Direct (Fast & 100% Face Match)
+    # 1. Primary Engine: InstantX/InstantID
     try:
-        logger.info("Calling Direct InstantID engine...")
-        instant_client = get_direct_hf_client_with_retry("https://instantx-instantid.hf.space", max_retries=5)
+        logger.info("Calling Primary Engine: InstantX/InstantID...")
+        instant_client = get_hf_client("InstantX/InstantID", max_retries=3)
         res = instant_client.predict(
             face_image_path=handle_file(face_image_path),
             pose_image_path=handle_file(face_image_path),
             prompt=enhanced_prompt,
             negative_prompt=negative_prompt,
             style_name="(No style)",
-            num_steps=35,
-            identitynet_strength_ratio=1.25,
-            adapter_strength_ratio=1.05,
+            num_steps=30,
+            identitynet_strength_ratio=1.10,
+            adapter_strength_ratio=0.90,
             canny_strength=0.0,
             depth_strength=0.0,
             controlnet_selection=[],
@@ -336,24 +321,26 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
             raw_path = res[0]
             if isinstance(raw_path, dict) and "path" in raw_path:
                 raw_path = raw_path["path"]
+            logger.info(f"InstantID generated output successfully: {raw_path}")
             return apply_aspect_ratio(str(raw_path), ratio_str)
     except Exception as e:
-        logger.warning(f"Direct InstantID encountered: {e}. Trying PuLID-FLUX...")
+        logger.warning(f"InstantX/InstantID encountered error: {e}. Failing over to PuLID-FLUX...")
 
-    # 2. Secondary Engine: PuLID-FLUX Direct
+    # 2. Secondary Engine: yanze/PuLID-FLUX
     try:
-        flux_client = get_direct_hf_client_with_retry("https://yanze-pulid-flux.hf.space", max_retries=5)
+        logger.info("Calling Secondary Engine: yanze/PuLID-FLUX...")
+        flux_client = get_hf_client("yanze/PuLID-FLUX", max_retries=3)
         res = flux_client.predict(
             prompt=enhanced_prompt,
             id_image=handle_file(face_image_path),
             start_step=0,
-            guidance=4.2,
+            guidance=4.0,
             seed=str(int(time.time()) % 1000000),
             true_cfg=1.0,
             width=w,
             height=h,
-            num_steps=28,
-            id_weight=1.40,
+            num_steps=24,
+            id_weight=1.25,
             neg_prompt=negative_prompt,
             timestep_to_start_cfg=1.0,
             max_sequence_length=512,
@@ -363,38 +350,12 @@ def generate_photorealistic_image(face_image_path: str, prompt: str, ratio_str: 
             raw_path = res[0]
             if isinstance(raw_path, dict) and "path" in raw_path:
                 raw_path = raw_path["path"]
+            logger.info(f"PuLID-FLUX generated output successfully: {raw_path}")
             return apply_aspect_ratio(str(raw_path), ratio_str)
     except Exception as e:
-        logger.warning(f"Direct PuLID-FLUX encountered: {e}. Trying PuLID SDXL...")
+        logger.error(f"PuLID-FLUX encountered error: {e}")
 
-    # 3. Tertiary Engine: PuLID SDXL Direct
-    pulid_sdxl = get_direct_hf_client_with_retry("https://yanze-pulid.hf.space", max_retries=3)
-    res = pulid_sdxl.predict(
-        param_0=handle_file(face_image_path),
-        param_1=handle_file(face_image_path),
-        param_2=handle_file(face_image_path),
-        param_3=handle_file(face_image_path),
-        param_4=enhanced_prompt,
-        param_5=negative_prompt,
-        param_6=1.3,
-        param_7=1,
-        param_8=int(time.time()) % 1000000,
-        param_9=4,
-        param_10=h,
-        param_11=w,
-        param_12=1.0,
-        param_13="fidelity",
-        param_14=False,
-        api_name="/run"
-    )
-    if isinstance(res, (list, tuple)) and len(res) > 0:
-        raw_list = res[0]
-        if isinstance(raw_list, list) and len(raw_list) > 0:
-            first_item = raw_list[0]
-            img_path = first_item.get("image", {}).get("path") if isinstance(first_item, dict) else str(first_item)
-            return apply_aspect_ratio(str(img_path), ratio_str)
-
-    raise ValueError("Image generation failed on all available engines.")
+    raise ValueError("Image generation failed on available AI engines. Please check your prompt or try again shortly.")
 
 # ----------------- Telegram Handlers -----------------
 
@@ -481,9 +442,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_msg = (
         "📊 **Bot Status:**\n"
-        "• **AI Engine:** Direct Endpoint Failover (InstantID + PuLID-FLUX)\n"
-        "• **Face Lock:** 🟢 100% High-Fidelity (1.25x - 1.40x Weight)\n"
-        "• **Connection Mode:** 🟢 Direct Cloud Bypass (No 503 Errors)\n"
+        "• **AI Engine:** Official Hugging Face Gateway (InstantID + PuLID-FLUX)\n"
+        "• **Face Lock:** 🟢 100% High-Fidelity\n"
         "• **Content Policy:** 🔓 100% Unrestricted / Uncensored\n"
         f"• **Target Ratio:** `{current_ratio}`\n"
         f"• **Face Status:** {has_face}\n"
@@ -573,7 +533,7 @@ async def generate_image_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"• **Prompt:** _{prompt}_\n"
         f"• **Ratio:** `{ratio_str}`\n"
         "• **Quality:** 📸 100% Face Match + Real Body Physics\n\n"
-        "⚡ *Generating image (20-30 seconds lag sakte hain, please wait...)*",
+        "⚡ *Processing image (20-30 seconds lag sakte hain, please wait...)*",
         parse_mode="Markdown"
     )
 
@@ -631,7 +591,7 @@ def main():
 
     print("========================================")
     print("🤖 Starting Uncensored Real DSLR Face Bot")
-    print("📦 Engine: Direct Subdomain Zero-503 Connection")
+    print("📦 Engine: Official Hugging Face Gateway Multi-Failover")
     print("💎 Fidelity: 100% Face Match + Zero Restrictions")
     print(f"💾 Temp Directory: {TEMP_DIR}")
     print("========================================")
